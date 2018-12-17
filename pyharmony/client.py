@@ -3,206 +3,614 @@
 
 """Client class for connecting to Logitech Harmony devices."""
 
+import asyncio
 import json
 import time
 import re
-import sleekxmpp
-from sleekxmpp.xmlstream import ET
-from sleekxmpp.xmlstream.handler.callback import Callback
-from sleekxmpp.xmlstream.matcher.base import MatcherBase
+import slixmpp
+from functools import partial
+from slixmpp.exceptions import IqTimeout
+from slixmpp.xmlstream import ET
+from slixmpp.xmlstream.handler.callback import Callback
+from slixmpp.xmlstream.matcher import MatchXPath
+from slixmpp.xmlstream.matcher.base import MatcherBase
 import logging
 
 logger = logging.getLogger(__name__)
 
-class HarmonyClient(sleekxmpp.ClientXMPP):
+HARMONY_DEFAULT_PORT = '5222'
+HARMONY_DEFAULT_RETRIES = 2
+HARMONY_DEFAULT_TIMEOUT = 5
+HARMONY_MIME = 'vnd.logitech.harmony/vnd.logitech.harmony.engine'
+HARMONY_NS = 'connect.logitech.com'
+HARMONY_USER = 'user@connect.logitech.com/gatorade.'
+HARMONY_PASSWORD = 'password'
+
+
+class HarmonyClient(slixmpp.ClientXMPP):
     """An XMPP client for connecting to the Logitech Harmony devices."""
 
-    def __init__(self):
-        user = 'user@connect.logitech.com/gatorade.'
-        password = 'password'
+    def __init__(self, loop=None, ip_address=None, port=None, timeout=None,
+                 retries=None):
+        self._ip_address = ip_address
+        self._port = port if port else HARMONY_DEFAULT_PORT
+        self._timeout = timeout if timeout else HARMONY_DEFAULT_TIMEOUT
+        self._retries = retries if retries else HARMONY_DEFAULT_RETRIES
+
+        self._event_loop = asyncio.get_event_loop()
+
         plugin_config = {
             # Enables PLAIN authentication which is off by default.
             'feature_mechanisms': {'unencrypted_plain': True},
         }
         super(HarmonyClient, self).__init__(
-            user, password, plugin_config=plugin_config)
+            HARMONY_USER, HARMONY_PASSWORD, plugin_config=plugin_config)
 
-    def get_config(self):
-        """Retrieves the Harmony device configuration.
+        # Set keep-alive to 30 seconds.
+        self.whitespace_keepalive_interval = 30
+
+        def handleHarmonyResponse(iq):
+            """Change Harmony HUB response type from invalid 'get' to
+
+            'result'."""
+            if iq['type'] == 'get':
+                iq['type'] = 'result'
+
+        self.register_handler(
+            Callback('Harmony Result',
+                     MatchXPath('{{{0}}}iq/{{{1}}}oa'.format(self.default_ns,
+                                                             HARMONY_NS)),
+                     handleHarmonyResponse))
+
+
+
+    async def send_request(self, timeout=None, mime=None,
+                           request=None, command=None,Block=True,
+                           callback=None, type='get'):
+        """Send request to Harmony HUB."""
+        timeout = self._timeout if timeout is None else timeout
+        logger.debug("Timeout : %s", timeout)
+        if not self.is_connected():
+            # Try to connect, return if unable to connect.
+            if not await self.async_connect(
+                    ip_address=self._ip_address, port=self._port, Block=True):
+                return
+
+        mime = mime if mime else HARMONY_MIME
+
+        if type == 'query':
+            iq_stanza = self.make_iq_query()
+        elif type == 'set':
+            iq_stanza = self.make_iq_set()
+        elif type == 'result':
+            iq_stanza = self.make_iq_result()
+        elif type == 'error':
+            iq_stanza = self.make_iq_error()
+        else:
+            iq_stanza = self.make_iq_get()
+
+        action_cmd = ET.Element('oa')
+        action_cmd.attrib['xmlns'] = HARMONY_NS
+        action_cmd.attrib['mime'] = '{}?{}'.format(
+            mime, request) if request else '{}'.format(mime)
+        action_cmd.text = command if command else None
+        iq_stanza.set_payload(action_cmd)
+
+        logger.debug("Sending request %s for mime %s", request, mime)
+        try:
+            if Block:
+                try:
+                    result = await iq_stanza.send(
+                        callback=callback, timeout=timeout)
+                except IqTimeout:
+                    logger.error('XMPP timeout')
+                    result = None
+                    pass
+            else:
+                result = iq_stanza.send(callback=callback,
+                                        timeout=timeout)
+        except Exception as ex:
+            logger.critical('XMPP Exception: %s', ex)
+            raise
+        return result
+
+    async def async_connect(self, Block=True, ip_address=None, port=None):
+        """Connect to Harmony HUB
+
+        Args:
+            Block (Optional, DEFAULT=False):
+                True: Run till completion and return result.
+                False: Executes and then returns future allowing to check
+                       connection result later.
+
+            ip_address (Optional):
+                IP address (or hostname) for Harmony HUB to override IP
+                address provided during initialization
+
+            port (Optional):
+                Port for Harmony Hub to override port provided during
+                initialization
 
         Returns:
-            A nested dictionary containing activities, devices, etc.
+            Block=True: Boolean
+            Block=False: Future that will have Boolean as its result
+
+        Raises:
+              Any exception except for timeout
         """
-        iq_cmd = self.Iq()
-        iq_cmd['type'] = 'get'
-        action_cmd = ET.Element('oa')
-        action_cmd.attrib['xmlns'] = 'connect.logitech.com'
-        action_cmd.attrib['mime'] = (
-            'vnd.logitech.harmony/vnd.logitech.harmony.engine?config')
-        iq_cmd.set_payload(action_cmd)
-        retries = 3
-        attempt = 0
+        loop = asyncio.get_event_loop()
+        complete_future = loop.create_future()
 
-        for _ in range(retries):
-            try:
-                result = iq_cmd.send(block=True)
-                break
-            except Exception:
-                logger.critical('XMPP timeout, reattempting')
-                attempt += 1
-                pass
-        if attempt == 3:
-            raise ValueError('XMPP timeout with hub')
+        await self._async_perform_connect(future_result=complete_future,
+                                          ip_address=ip_address, port=port)
 
-        payload = result.get_payload()
+        if Block:
+            logger.debug("Waiting for connect to complete")
+            return await complete_future
+
+        return complete_future
+
+    async def _async_perform_connect(self, future_result, ip_address=None,
+                                     port=None):
+        """Connect to Harmony HUB."""
+        async def session_start(event):
+            logger.debug("Connected to %s on port %s",
+                self._ip_address, self._port)
+            future_result.set_result(True)
+
+        if self.is_connected():
+            await self.async_disconnect(True)
+
+        self._ip_address = ip_address if ip_address else self._ip_address
+        self._port = port if port else self._port
+
+        # Return if no IP address.
+        if not self._ip_address:
+            future_result.set_result(False)
+            return future_result
+
+        logger.debug("Initiating connection to %s on port %s",
+            self._ip_address, self._port)
+        self.add_event_handler('session_start', session_start, disposable=True)
+        super(HarmonyClient, self).connect(
+            address=(self._ip_address, self._port), disable_starttls=True,
+            use_ssl=False)
+
+        return
+
+    async def async_disconnect(self, Block=True):
+        """Disconnect from Harmony Hub.
+
+        Args:
+            Block (Optional, DEFAULT=False):
+                True: Run till completion and return result.
+                False: Executes and then returns future allowing to check
+                       disconnect result later.
+
+        Returns:
+            Block=True: Boolean
+            Block=False: Future that will have Boolean as its result
+
+        Raises:
+              Any exception except for timeout
+        """
+        loop = asyncio.get_event_loop()
+        complete_future = loop.create_future()
+
+        await self._async_perform_disconnect(future_result=complete_future)
+
+        if Block:
+            logger.debug("Waiting for disconnect to complete")
+            return await complete_future
+
+        return complete_future
+
+    async def _async_perform_disconnect(self, future_result):
+        """Disconnect from Harmony Hub."""
+
+        async def disconnected(event):
+            logger.debug("Disconnected from %s on port %s",
+                self._ip_address, self._port)
+            future_result.set_result(True)
+
+        if not self.is_connected():
+            return
+
+        logger.debug("Initiating disconnect from %s on port %s",
+            self._ip_address, self._port)
+        self.add_event_handler('disconnected', disconnected, disposable=True)
+        super(HarmonyClient, self).disconnect()
+
+        return
+
+    async def async_get_config(self, Block=True):
+        """Retrieve Harmony Hub configuration
+
+        Args:
+            Block (Optional, DEFAULT=False):
+                True: Run till completion and return result.
+                False: Executes and then returns future allowing to
+                       retrieve the configuration result later.
+
+        Returns:
+            Block=True: Configuration in json format
+            Block=False: Future that will have Configuration in json format
+                         as its result
+
+        Raises:
+              Any exception except for timeout
+        """
+
+        loop = asyncio.get_event_loop()
+        complete_future = loop.create_future()
+
+        await self._async_perform_get_config(
+            future_result=complete_future, Block=Block)
+
+        if Block:
+            logger.debug("Waiting to receive configuration")
+            return await complete_future
+
+        return complete_future
+
+    async def _async_perform_get_config(self, future_result, Block=True):
+        """Retrieve Harmony Hub configuration."""
+        def reply_received(result):
+            logger.debug("Configuration received")
+            future_result.set_result(self.parse_config(result))
+
+        config = await self.send_request(request='config',
+                                         callback=reply_received, Block=Block)
+
+        return config
+
+    def parse_config(self, config):
+        """Parse provided  Harmony configuration
+
+        Returns:
+            A nested dictionary containing activities, devices, etc."""
+        payload = config.get_payload()
         assert len(payload) == 1
         action_cmd = payload[0]
         assert action_cmd.attrib['errorcode'] == '200'
         device_list = action_cmd.text
         return json.loads(device_list)
 
-    def get_current_activity(self):
-        """Retrieves the current activity ID.
+    async def async_get_current_activity(self, Block=True):
+        """Retrieve current activity
+
+        Args:
+            Block (Optional):
+                True: Run till completion and return result.
+                False: Executes and then returns future allowing to
+                       retrieve the configuration result later.
 
         Returns:
-            A int with the current activity ID.
+            Block=True: Activity ID
+            Block=False: Future that will have Activity ID
+
+        Raises:
+              Any exception except for timeout
         """
-        iq_cmd = self.Iq()
-        iq_cmd['type'] = 'get'
-        action_cmd = ET.Element('oa')
-        action_cmd.attrib['xmlns'] = 'connect.logitech.com'
-        action_cmd.attrib['mime'] = (
-            'vnd.logitech.harmony/vnd.logitech.harmony.engine?getCurrentActivity')
-        iq_cmd.set_payload(action_cmd)
-        try:
-            result = iq_cmd.send(block=True)
-        except Exception:
-            logger.info('XMPP timeout, reattempting')
-            result = iq_cmd.send(block=True)
-        payload = result.get_payload()
+
+        loop = asyncio.get_event_loop()
+        complete_future = loop.create_future()
+
+        await self._async_perform_get_current_activity(
+            future_result=complete_future, Block=Block)
+
+        if Block:
+            logger.debug("Waiting to receive current activity")
+            return await complete_future
+
+        return complete_future
+
+    async def _async_perform_get_current_activity(self,
+                                                  future_result, Block=True):
+        """Retrieves the current activity ID."""
+        def reply_received(result):
+            logger.debug("Activity received")
+            future_result.set_result(self.parse_current_activity(result))
+
+        activity = await self.send_request(request='getCurrentActivity',
+                                         callback=reply_received, Block=Block)
+
+        return activity
+
+    def parse_current_activity(self, activity):
+        payload = activity.get_payload()
         assert len(payload) == 1
         action_cmd = payload[0]
         assert action_cmd.attrib['errorcode'] == '200'
         activity = action_cmd.text.split("=")
         return int(activity[1])
 
-    def start_activity(self, activity_id):
-        """Starts an activity.
+    async def async_start_activity(self, Block=True, activity_id=-1):
+        """Start an activity
 
         Args:
-            activity_id: An int or string identifying the activity to start
+            Block (Optional, DEFAULT=False):
+                True: Run till completion and return result.
+                False: Executes and then returns future allowing to
+                       retrieve the configuration result later.
+
+            activity_id (Optional, DEFAULT=-1):
+                Activity ID to start
 
         Returns:
-            True if activity started, otherwise False
-        """
-        iq_cmd = self.Iq()
-        iq_cmd['type'] = 'get'
-        action_cmd = ET.Element('oa')
-        action_cmd.attrib['xmlns'] = 'connect.logitech.com'
-        action_cmd.attrib['mime'] = ('harmony.engine?startactivity')
-        cmd = 'activityId=' + str(activity_id) + ':timestamp=0'
-        action_cmd.text = cmd
-        iq_cmd.set_payload(action_cmd)
-        try:
-            result = iq_cmd.send(block=True)
-        except Exception:
-            logger.info('XMPP timeout, reattempting')
-            result = iq_cmd.send(block=True)
-        payload = result.get_payload()
-        assert len(payload) == 1
-        action_cmd = payload[0]
-        if action_cmd.text == None:
-            return True
-        else:
-            return False
+            Block=True: Activity ID
+            Block=False: Future that will have Activity ID
 
-    def sync(self):
+        Raises:
+              Any exception except for timeout
+        """
+
+        loop = asyncio.get_event_loop()
+        complete_future = loop.create_future()
+
+        await self._async_perform_start_activity(
+            future_result=complete_future, Block=Block,
+            activity_id=activity_id)
+
+        if Block:
+            logger.debug("Waiting for activity to complete")
+            return await complete_future
+
+        return complete_future
+
+    async def _async_perform_start_activity(self, future_result, Block=True,
+                                            activity_id=-1):
+        """Starts an activity."""
+        def reply_received(result):
+            logger.debug("Activity started")
+            future_result.set_result(self.parse_start_activity(result))
+
+        command = 'activityId={0}:timestamp=0'.format(activity_id)
+        activity = await self.send_request(request='runactivity',
+                                           callback=reply_received,
+                                           Block=Block,
+                                           mime = 'harmony.activityengine',
+                                           command=command)
+
+        return activity
+
+    def parse_start_activity(self, activity):
+            payload = activity.get_payload()
+            assert len(payload) == 1
+            action_cmd = payload[0]
+            logger.debug("Result : %s", action_cmd.text)
+            if action_cmd.text is None:
+                return True
+            else:
+                return False
+
+    async def async_sync(self, Block=True):
+        """Sync Harmony Hub with Web
+
+        Args:
+            Block (Optional, DEFAULT=False):
+                True: Run till completion and return result.
+                False: Executes and then returns future allowing to
+                       retrieve the configuration result later.
+
+        Returns:
+            Block=True: Boolean confirming sync is completed
+            Block=False: Future that will have Boolean confirming sync
+                        is completed
+        Raises:
+              Any exception except for timeout
+        """
+
+        loop = asyncio.get_event_loop()
+        complete_future = loop.create_future()
+
+        await self._async_perform_sync(
+            future_result=complete_future, Block=Block,
+            activity_id=activity_id)
+
+        if Block:
+            logger.debug("Waiting for sync to complete")
+            return await complete_future
+
+        return complete_future
+
+    async def _async_perform_sync(self, future_result, Block=True):
+        """Perform sync between Hub and Web Service"""
+        def reply_received(result):
+            logger.debug("Activity started")
+            future_result.set_result(self.parse_sync(result))
+
+        command = 'activityId={0}:timestamp={1}'.format(
+            activity_id, int(time.time()))
+        activity = await self.send_request(callback=reply_received,
+                                           Block=Block,
+                                           mime='setup.sync')
+
+        return activity
+
+    def parse_sync(self, result):
         """Syncs the harmony hub with the web service.
         """
-        iq_cmd = self.Iq()
-        iq_cmd['type'] = 'get'
-        action_cmd = ET.Element('oa')
-        action_cmd.attrib['xmlns'] = 'connect.logitech.com'
-        action_cmd.attrib['mime'] = ('setup.sync')
-        iq_cmd.set_payload(action_cmd)
-        try:
-            result = iq_cmd.send(block=True)
-        except Exception:
-            logger.info('XMPP timeout, reattempting')
-            result = iq_cmd.send(block=True)
-        payload = result.get_payload()
-        assert len(payload) == 1
+        if result:
+            payload = result.get_payload()
+            assert len(payload) == 1
+            return True
 
-    def send_command(self, device, command, command_delay=0):
+        return False
+
+    async def async_send_command(self, Block=True, device=None,
+                                 command=None, command_delay=0):
+        """Retrieve current activity
+
+        Args:
+            Block (Optional):
+                True: Run till completion and return result.
+                False: Executes and then returns future allowing to
+                       retrieve the configuration result later.
+
+        Returns:
+            Block=True: Activity ID
+            Block=False: Future that will have Activity ID
+
+        Raises:
+              Any exception except for timeout
+        """
+
+        loop = asyncio.get_event_loop()
+        complete_future = loop.create_future()
+
+        func=self._async_perform_send_command(
+            future_result=complete_future, device=device,
+            command=command, command_delay=command_delay)
+        result = asyncio.ensure_future(func)
+
+        if Block:
+            logger.debug("Waiting to receive confirmation on send command")
+            await result
+            return await complete_future
+
+        return complete_future
+
+    async def _async_perform_send_command(self, future_result, device=None,
+                                          command=None, command_delay=0
+                                          ):
+        if not device or not command:
+            future_result.set_result(False)
+            return
+
+        send_command = 'action={{"type"::"IRCommand","deviceId"::"{0}",' \
+                  '"command"::"{1}"}}:status='.format(device, command)
+
+        logger.debug("Pressing button")
+        result1 = await self.send_request(request='holdAction',
+                                         Block=False,
+                                         command=send_command + 'press',
+                                         type='query')
+        logger.debug("Button pressed")
+
+        if command_delay > 0:
+            await asyncio.sleep(command_delay)
+
+        logger.debug("Releasing button")
+        result2 = await self.send_request(request='holdAction',
+                                         Block=False,
+                                         command=send_command + 'release',
+                                         type='query')
+        logger.debug("Button released")
+
+        future_result.set_result(True)
+
+        return
+
+    async def send_command(self, device, command, command_delay=0, Block=True):
         """Send a simple command to the Harmony Hub.
 
         Args:
-            device_id (str): Device ID from Harmony Hub configuration to control
+            device_id (str): Device ID from Harmony Hub configuration to
+                             control
             command (str): Command from Harmony Hub configuration to control
-            command_delay (int): Delay in seconds between sending the press command and the release command.
+            command_delay (int): Delay in seconds between sending the press
+                                 command and the release command.
 
         Returns:
             None if successful
         """
-        iq_cmd = self.Iq()
-        iq_cmd['type'] = 'get'
-        iq_cmd['id'] = '5e518d07-bcc2-4634-ba3d-c20f338d8927-2'
-        action_cmd = ET.Element('oa')
-        action_cmd.attrib['xmlns'] = 'connect.logitech.com'
-        action_cmd.attrib['mime'] = (
-            'vnd.logitech.harmony/vnd.logitech.harmony.engine?holdAction')
-        action_cmd.text = 'action={"type"::"IRCommand","deviceId"::"' + device + '","command"::"' + command + '"}:status=press'
-        iq_cmd.set_payload(action_cmd)
-        result = iq_cmd.send(block=False)
 
-        time.sleep(command_delay)
+        # Send pressing the button.
+        result = await self.send_request(
+            request='holdAction',
+            command=command + 'press'
+            )
 
-        action_cmd.attrib['mime'] = (
-            'vnd.logitech.harmony/vnd.logitech.harmony.engine?holdAction')
-        action_cmd.text = 'action={"type"::"IRCommand","deviceId"::"' + device + '","command"::"' + command + '"}:status=release'
-        iq_cmd.set_payload(action_cmd)
-        result = iq_cmd.send(block=False)
+        if not result:
+            return
+
+        await asyncio.sleep(command_delay)
+
+        # Send releasing the button.
+        result = await self.send_request(
+            request='holdAction',
+            command=command + 'release',
+            timeout=0)
+
         return result
 
-    def change_channel(self, channel):
+    async def async_change_channel(self, Block=False, channel=None):
+        """Retrieve current activity
+
+        Args:
+            Block (Optional):
+                True: Run till completion and return result.
+                False: Executes and then returns future allowing to
+                       retrieve the configuration result later.
+
+        Returns:
+            Block=True: Activity ID
+            Block=False: Future that will have Activity ID
+
+        Raises:
+              Any exception except for timeout
+        """
+
+        loop = asyncio.get_event_loop()
+        complete_future = loop.create_future()
+
+        await self._async_change_channel(
+            future_result=complete_future, Block=Block, channel=channel)
+
+        if Block:
+            logger.debug("Waiting to receive confirmation on change channel")
+            return await complete_future
+
+        return complete_future
+
+    async def async_perform_change_channel(self, future_result, Block=True,
+                                           channel=None):
         """Changes a channel.
         Args:
             channel: Channel number
         Returns:
           An HTTP 200 response (hopefully)
         """
-        iq_cmd = self.Iq()
-        iq_cmd['type'] = 'get'
-        action_cmd = ET.Element('oa')
-        action_cmd.attrib['xmlns'] = 'connect.logitech.com'
-        action_cmd.attrib['mime'] = ('harmony.engine?changeChannel')
-        cmd = 'channel=' + str(channel) + ':timestamp=0'
-        action_cmd.text = cmd
-        iq_cmd.set_payload(action_cmd)
-        try:
-            result = iq_cmd.send(block=True)
-        except Exception:
-            logger.info('XMPP timeout, reattempting')
-            result = iq_cmd.send(block=True)
+        def reply_received(result):
+            logger.debug("Activity started")
+            future_result.set_result(self.parse_change_channel(result))
+
+        send_command = 'channel={0}:timestamp=0'.format(channel)
+        activity = await self.send_request(request='changeChannel',
+                                           callback=reply_received,
+                                           Block=Block,
+                                           mime='setup.sync',
+                                           command=send_command)
+
+        return activity
+
+    def parse_change_channel(self, result):
         payload = result.get_payload()
         assert len(payload) == 1
         action_cmd = payload[0]
-        if action_cmd.text == None:
+        if action_cmd.text is None:
             return True
-        else:
-            return False
 
+        return False
 
-    def power_off(self):
+    async def power_off(self, Block=True):
         """Turns the system off if it's on, otherwise it does nothing.
 
         Returns:
             True if the system becomes or is off
         """
-        activity = self.get_current_activity()
+        activity = await self.get_current_activity()
         if activity != -1:
-            return self.start_activity(-1)
+            if not Block:
+                return self.start_activity(-1, Block=Block)
+            return await self.start_activity(-1)
         else:
+            if not Block:
+                result = self._event_loop.create_future()
+                result.set_result(True)
+                return result
+
             return True
 
     def register_activity_callback(self, activity_callback):
@@ -213,7 +621,9 @@ class HarmonyClient(sleekxmpp.ClientXMPP):
             if activity_id is not None:
                 activity_callback(int(activity_id))
 
-        self.registerHandler(Callback('Activity Finished', MatchHarmonyEvent('startActivityFinished'), hub_event))
+        self.registerHandler(Callback(
+            'Activity Finished', MatchHarmonyEvent('startActivityFinished'),
+            hub_event))
 
 
 class MatchHarmonyEvent(MatcherBase):
@@ -222,39 +632,37 @@ class MatchHarmonyEvent(MatcherBase):
         payload = xml.get_payload()
         if len(payload) == 1:
             msg = payload[0]
-            if msg.tag == '{connect.logitech.com}event' and msg.attrib['type'] == 'harmony.engine?' + self._criteria:
+            if msg.tag == '{connect.logitech.com}event' and\
+               msg.attrib['type'] == 'harmony.engine?' + self._criteria:
                 return True
         return False
 
+class HarmonyError(Exception):
+        pass
 
-def create_and_connect_client(ip_address, port, activity_callback=None, connect_attempts=5):
+class HarmonySyncInAsyncError(HarmonyError):
+        pass
+
+async def create_and_connect_client(ip_address, port, activity_callback=None,
+                                    connect_attempts=5):
 
     """Creates a Harmony client and initializes session.
 
     Args:
         ip_address (str): Harmony device IP address
         port (str): Harmony device port
-        activity_callback (function): Function to call when the current activity has changed.
+        activity_callback (function): Function to call when the current
+                                      activity has changed.
 
 
     Returns:
         A connected HarmonyClient instance
     """
-    client = HarmonyClient()
-    i = 0
-    connected = False
-    while (i < connect_attempts and not connected):
-        i = i + 1
-        connected = client.connect(address=(ip_address, port),
-                                   use_tls=False, use_ssl=False, reattempt=False)
-    if i == connect_attempts:
-        logger.error("Failed to connect to %s:%s after %d tries" % (ip_address,port,i))
-        client.disconnect(send_close=True)
-        return False
-    client.process(block=False)
-    client.whitespace_keepalive_interval = 30
+    client = HarmonyClient(ip_address, port)
+    await client.connect()
+#    client.process(block=False)
     if activity_callback:
         client.register_activity_callback(activity_callback)
-    while not client.sessionstarted:
-        time.sleep(0.1)
+#    while not client.sessionstarted:
+#        await asyncio.sleep(0.1)
     return client
