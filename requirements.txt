@@ -1,3 +1,5 @@
 argparse
 requests
 sleekxmpp
+aiohttp
+websockets
