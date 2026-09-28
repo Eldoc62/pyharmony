@@ -18,11 +18,12 @@ from scheduling import get_target_datetimes
 
 def main() -> None:
     config = load_config()
-    client = BasicFitClient(config.email, config.password)
+    client = BasicFitClient(config.email, config.password, config.club_id)
 
     print("Connexion à BasicFit...")
     client.login()
     print(f"OK — club_id = {client.club_id}")
+    print("(club attendu : Petite Synthe rue Kruysbelleart 24/7)")
 
     target = get_target_datetimes(config.target_time, config.window_days)[0]
     print(f"Récupération du planning pour {target.date()} (cherche {config.target_time})...")

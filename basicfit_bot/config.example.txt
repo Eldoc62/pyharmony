@@ -9,6 +9,8 @@ TELEGRAM_BOT_TOKEN=123456789:AAExempleDeToken
 TELEGRAM_CHAT_ID=123456789
 
 # Optionnel — valeurs par défaut ci-dessous
+# CLUB_ID par défaut = Petite Synthe rue Kruysbelleart 24/7 (déjà confirmé sur le compte)
+CLUB_ID=60850610-267A-47FE-9A85-60CF760453CD
 TARGET_TIME=05:30
 SCRAPE_INTERVAL_SECONDS=30
 WINDOW_DAYS=10

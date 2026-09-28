@@ -25,11 +25,11 @@ logger = setup_logging()
 
 def run() -> None:
     config = load_config()
-    client = BasicFitClient(config.email, config.password)
+    client = BasicFitClient(config.email, config.password, config.club_id)
 
     while True:
         try:
-            if client.club_id is None:
+            if not client.is_authenticated:
                 client.login()
 
             targets = get_target_datetimes(config.target_time, config.window_days)
@@ -51,7 +51,7 @@ def run() -> None:
 
         except BasicFitAuthError as exc:
             logger.warning("Session invalide (%s), ré-authentification au prochain cycle.", exc)
-            client.club_id = None
+            client.invalidate_session()
         except Exception:
             logger.exception("Erreur inattendue pendant le cycle de scraping, on continue.")
 

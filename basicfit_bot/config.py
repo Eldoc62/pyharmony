@@ -15,6 +15,10 @@ REQUIRED_KEYS = {
     "TELEGRAM_CHAT_ID",
 }
 
+# Club "Petite Synthe rue Kruysbelleart 24/7", relevé directement depuis le
+# compte de l'utilisateur (déjà son club par défaut) sur member.basic-fit.com/booking.
+DEFAULT_CLUB_ID = "60850610-267A-47FE-9A85-60CF760453CD"
+
 
 @dataclass
 class Config:
@@ -22,6 +26,7 @@ class Config:
     password: str
     telegram_token: str
     telegram_chat_id: str
+    club_id: str
     target_time: dt.time
     scrape_interval_seconds: int
     window_days: int
@@ -59,6 +64,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         password=values["BASICFIT_PASSWORD"],
         telegram_token=values["TELEGRAM_BOT_TOKEN"],
         telegram_chat_id=values["TELEGRAM_CHAT_ID"],
+        club_id=values.get("CLUB_ID", DEFAULT_CLUB_ID),
         target_time=target_time,
         scrape_interval_seconds=int(values.get("SCRAPE_INTERVAL_SECONDS", "30")),
         window_days=int(values.get("WINDOW_DAYS", "10")),
