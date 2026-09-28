@@ -12,3 +12,7 @@ pyharmony.egg-info
 
 PyCharms
 .idea/
+
+# BasicFit bot — secrets et logs locaux, jamais committés.
+basicfit_bot/config/credentials.txt
+basicfit_bot/logs/

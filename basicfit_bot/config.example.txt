@@ -1,0 +1,14 @@
+# Copie ce fichier vers config/credentials.txt et remplis les valeurs.
+# Ne jamais committer credentials.txt dans un dépôt git (il contient des secrets).
+# Sur le NAS : chmod 600 config/credentials.txt
+
+BASICFIT_EMAIL=ton-email@example.com
+BASICFIT_PASSWORD=ton-mot-de-passe
+
+TELEGRAM_BOT_TOKEN=123456789:AAExempleDeToken
+TELEGRAM_CHAT_ID=123456789
+
+# Optionnel — valeurs par défaut ci-dessous
+TARGET_TIME=05:30
+SCRAPE_INTERVAL_SECONDS=30
+WINDOW_DAYS=10
